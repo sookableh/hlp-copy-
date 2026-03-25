@@ -6,4 +6,3 @@ By splitting into two sub-accounts, each one can hold a clean long or short posi
 
 If it were a single account, you'd have to net everything — closing a long to go short means realizing losses, paying fees, and missing the bid-ask spread in between. Two accounts let you market-make both sides of the book cleanly without those issues.
 
-That's also why the "position value" looked inflated earlier — each child holds ~$2.7M in BTC positions, but the net exposure is only ~$5K. The vault is earning the spread on $5.4M of gross volume while only being directionally exposed on a tiny fraction.
