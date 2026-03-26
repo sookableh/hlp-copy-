@@ -1,5 +1,5 @@
 This bot copies the HLP vault positions and atttempts to track the current positions as well as all trades 
-adjust poll rates to your desires.
+Adjusted to websocket for fills ( can adjust to polls as you wish ).
 
 heres how the HLP vault works 
 By splitting into two sub-accounts, each one can hold a clean long or short position independently. They don't need to close one side before opening the other — Child 1 just stays long, Child 4 stays short, and the vault collects the spread from both sides simultaneously.
