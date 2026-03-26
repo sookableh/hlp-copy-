@@ -1,0 +1,516 @@
+#this bot tracks the child vaults of the HLP market making strategy vault. specifically for liquid coins ( SOL BTC ETH ) 
+import asyncio
+import json
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+import aiohttp
+
+from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+
+# HLP Vault parent address on Hyperliquid
+HLP_VAULT_ADDRESS = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
+
+# ---- CONFIG ----
+COINS_TO_TRACK = ["SOL"]
+
+# Strategies to track individually (matched by name from API)
+STRATEGIES_TO_TRACK = ["HLP Strategy A", "HLP Strategy B"]
+
+POSITION_POLL_INTERVAL = 2
+NUM_RECENT_TRADES = 10
+
+NOTIFY_ON_POSITION_CHANGE = True
+NOTIFY_ON_NEW_TRADE = True
+
+
+class HlpVaultTrackerSol(ScriptStrategyBase):
+    """
+    Tracks HLP vault SOL positions per-strategy on Hyperliquid.
+    Shows separate tables for HLP Strategy A, HLP Strategy B, and combined.
+    Uses Hyperliquid public API directly — no API keys needed.
+    Does NOT place any orders.
+    """
+    markets = {"hyperliquid_perpetual": {"BTC-USD"}}
+
+    def __init__(self, connectors: Dict[str, ConnectorBase], config=None):
+        super().__init__(connectors, config)
+        self._last_position_poll: float = 0
+        self._previous_positions: Dict[str, Dict[str, Dict[str, Any]]] = {}  # strategy -> coin -> pos
+        self._strategy_positions: Dict[str, Dict[str, Dict[str, Any]]] = {}  # strategy -> coin -> pos
+        self._combined_positions: Dict[str, Dict[str, Any]] = {}  # coin -> pos
+        self._recent_trades: Dict[str, List[Dict[str, Any]]] = {}
+        self._last_seen_trade_time: Dict[str, int] = {}
+        self._child_addresses: List[str] = []
+        self._strategy_map: Dict[str, str] = {}  # name -> address
+        self._address_to_name: Dict[str, str] = {}  # address -> name
+        self._vault_info: Dict[str, Any] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._initialized: bool = False
+        self._current_prices: Dict[str, float] = {}
+        self._ws_started: bool = False
+        self._ws_tasks: List[asyncio.Task] = []
+        self._message_log: deque = deque(maxlen=20)
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def _api_request(self, payload: dict) -> Any:
+        session = await self._get_session()
+        try:
+            async with session.post(
+                HYPERLIQUID_INFO_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    self.logger().error(f"HLP API error: {response.status}")
+                    return None
+        except Exception as e:
+            self.logger().error(f"HLP API request failed: {e}")
+            return None
+
+    # ---- WebSocket for instant trade fills ----
+
+    async def _run_ws_for_address(self, address: str):
+        while True:
+            try:
+                session = await self._get_session()
+                async with session.ws_connect(HYPERLIQUID_WS_URL) as ws:
+                    subscribe_msg = {
+                        "method": "subscribe",
+                        "subscription": {"type": "userFills", "user": address}
+                    }
+                    await ws.send_json(subscribe_msg)
+                    name = self._address_to_name.get(address, address[:10])
+                    self.logger().info(f"WS connected for {name}")
+
+                    last_ping = time.time()
+                    while True:
+                        now = time.time()
+                        if now - last_ping >= 20:
+                            await ws.send_json({"method": "ping"})
+                            last_ping = now
+
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                raw = msg.data.replace("NaN", "null")
+                                data = json.loads(raw)
+                                if data.get("channel") == "pong":
+                                    continue
+                                self._handle_ws_fill(data, address)
+                            except (json.JSONDecodeError, ValueError) as e:
+                                self.logger().debug(f"WS parse error for {name}: {e}")
+                                continue
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                name = self._address_to_name.get(address, address[:10])
+                self.logger().warning(f"WS disconnected for {name}: {e}, reconnecting in 5s")
+                await asyncio.sleep(5)
+
+    def _notify(self, message: str):
+        self._message_log.append(message)
+        self.logger().info(message)
+
+    @staticmethod
+    def _safe_float(val, default=0.0) -> float:
+        if val is None:
+            return default
+        try:
+            f = float(val)
+            if f != f:
+                return default
+            return f
+        except (ValueError, TypeError):
+            return default
+
+    def _handle_ws_fill(self, data: dict, address: str):
+        channel = data.get("channel")
+        if channel != "userFills":
+            return
+
+        fills_data = data.get("data", {})
+        if isinstance(fills_data, dict):
+            fills_list = fills_data.get("fills", [])
+        elif isinstance(fills_data, list):
+            fills_list = fills_data
+        else:
+            return
+
+        strategy_name = self._address_to_name.get(address, address[:10])
+
+        for fill in fills_list:
+            coin = fill.get("coin", "")
+            if COINS_TO_TRACK and coin not in COINS_TO_TRACK:
+                continue
+
+            trade = {
+                "coin": coin,
+                "side": "BUY" if fill.get("side") == "B" else "SELL",
+                "price": self._safe_float(fill.get("px")),
+                "size": self._safe_float(fill.get("sz")),
+                "time": fill.get("time", int(time.time() * 1000)),
+                "fee": self._safe_float(fill.get("fee")),
+                "closed_pnl": self._safe_float(fill.get("closedPnl")),
+                "direction": fill.get("dir", ""),
+                "strategy": strategy_name,
+            }
+
+            if coin not in self._recent_trades:
+                self._recent_trades[coin] = []
+            self._recent_trades[coin].insert(0, trade)
+            self._recent_trades[coin] = self._recent_trades[coin][:NUM_RECENT_TRADES]
+            self._last_seen_trade_time[coin] = trade["time"]
+
+            if NOTIFY_ON_NEW_TRADE:
+                ts = datetime.fromtimestamp(trade["time"] / 1000, tz=timezone.utc)
+                self._notify(
+                    f"[TRADE][{strategy_name}] {coin}: {trade['side']} {trade['size']:.4f} @ "
+                    f"${trade['price']:.2f} | PnL: ${trade['closed_pnl']:.2f} | "
+                    f"{trade['direction']} | {ts.strftime('%H:%M:%S UTC')}")
+
+    async def _run_ws_all_mids(self):
+        """Subscribe to allMids for real-time mark prices (replaces REST metaAndAssetCtxs polling)."""
+        while True:
+            try:
+                session = await self._get_session()
+                async with session.ws_connect(HYPERLIQUID_WS_URL) as ws:
+                    await ws.send_json({
+                        "method": "subscribe",
+                        "subscription": {"type": "allMids"}
+                    })
+                    self.logger().info("WS connected for allMids price feed")
+
+                    last_ping = time.time()
+                    while True:
+                        now = time.time()
+                        if now - last_ping >= 20:
+                            await ws.send_json({"method": "ping"})
+                            last_ping = now
+
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                if data.get("channel") == "pong":
+                                    continue
+                                if data.get("channel") == "allMids":
+                                    mids = data.get("data", {}).get("mids", {})
+                                    for coin, price_str in mids.items():
+                                        if COINS_TO_TRACK and coin not in COINS_TO_TRACK:
+                                            continue
+                                        try:
+                                            self._current_prices[coin] = float(price_str)
+                                        except (ValueError, TypeError):
+                                            pass
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                self.logger().warning(f"allMids WS disconnected: {e}, reconnecting in 5s")
+                await asyncio.sleep(5)
+
+    async def _start_websockets(self):
+        if self._ws_started:
+            return
+        self._ws_started = True
+        for name, address in self._strategy_map.items():
+            task = safe_ensure_future(self._run_ws_for_address(address))
+            self._ws_tasks.append(task)
+        self._ws_tasks.append(safe_ensure_future(self._run_ws_all_mids()))
+        self.logger().info(f"Started {len(self._strategy_map)} fill feeds + allMids for {list(self._strategy_map.keys())}")
+
+    # ---- REST polling ----
+
+    async def _discover_child_addresses(self):
+        data = await self._api_request({
+            "type": "vaultDetails",
+            "vaultAddress": HLP_VAULT_ADDRESS,
+        })
+        if not data:
+            self.logger().error("Failed to fetch vault details")
+            return
+
+        self._vault_info = {
+            "name": data.get("name", "HLP Vault"),
+            "apr": data.get("apr"),
+        }
+
+        children = data.get("relationship", {}).get("data", {}).get("childAddresses", [])
+        if not children:
+            self.logger().error("No child addresses found")
+            return
+
+        self._child_addresses = children
+        self.logger().info(f"HLP Vault has {len(children)} child sub-accounts, resolving names...")
+
+        # Resolve each child's name
+        for address in children:
+            child_data = await self._api_request({
+                "type": "vaultDetails",
+                "vaultAddress": address,
+            })
+            if child_data:
+                name = child_data.get("name", "")
+                if name in STRATEGIES_TO_TRACK:
+                    self._strategy_map[name] = address
+                    self._address_to_name[address] = name
+                    self.logger().info(f"  Found: {name} -> {address[:10]}...")
+
+        if not self._strategy_map:
+            self.logger().error(f"None of {STRATEGIES_TO_TRACK} found among child vaults")
+        else:
+            self.logger().info(f"Tracking strategies: {list(self._strategy_map.keys())}")
+
+    async def _fetch_positions_for_address(self, address: str) -> List[Dict[str, Any]]:
+        data = await self._api_request({
+            "type": "clearinghouseState",
+            "user": address,
+        })
+        if data is None:
+            return []
+
+        positions = []
+        for pos in data.get("assetPositions", []):
+            item = pos.get("position", pos)
+            coin = item.get("coin", "")
+            szi = float(item.get("szi", 0))
+            if szi == 0:
+                continue
+            if COINS_TO_TRACK and coin not in COINS_TO_TRACK:
+                continue
+            positions.append({
+                "coin": coin,
+                "size": szi,
+                "entry_price": float(item.get("entryPx", 0)),
+                "position_value": float(item.get("positionValue", 0)),
+                "unrealized_pnl": float(item.get("unrealizedPnl", 0)),
+                "return_on_equity": float(item.get("returnOnEquity", 0)),
+                "leverage_type": item.get("leverage", {}).get("type", "unknown"),
+                "leverage_value": item.get("leverage", {}).get("value", 0),
+                "liquidation_price": item.get("liquidationPx"),
+                "margin_used": float(item.get("marginUsed", 0)),
+            })
+        return positions
+
+    async def _fetch_all_positions(self):
+        """Fetch positions per-strategy and build combined view."""
+        new_strategy_positions: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        combined: Dict[str, Dict[str, Any]] = {}
+
+        for name, address in self._strategy_map.items():
+            child_positions = await self._fetch_positions_for_address(address)
+            strategy_coins: Dict[str, Dict[str, Any]] = {}
+
+            for pos in child_positions:
+                coin = pos["coin"]
+                mark = self._current_prices.get(coin)
+                if mark:
+                    pos["position_value"] = abs(pos["size"]) * mark
+                pos["side"] = "LONG" if pos["size"] > 0 else "SHORT"
+                strategy_coins[coin] = pos
+
+                # Aggregate into combined
+                if coin in combined:
+                    existing = combined[coin]
+                    existing["size"] += pos["size"]
+                    existing["unrealized_pnl"] += pos["unrealized_pnl"]
+                    existing["margin_used"] += pos["margin_used"]
+                    existing["position_value"] += pos["position_value"]
+                else:
+                    combined[coin] = {
+                        "coin": coin,
+                        "size": pos["size"],
+                        "unrealized_pnl": pos["unrealized_pnl"],
+                        "position_value": pos["position_value"],
+                        "margin_used": pos["margin_used"],
+                    }
+
+            new_strategy_positions[name] = strategy_coins
+
+        # Finalize combined: compute effective entry, side, recalc value
+        filtered_combined: Dict[str, Dict[str, Any]] = {}
+        for coin, pos in combined.items():
+            if abs(pos["size"]) < 1e-10:
+                continue
+            pos["side"] = "LONG" if pos["size"] > 0 else "SHORT"
+            mark = self._current_prices.get(coin)
+            if mark:
+                pos["position_value"] = abs(pos["size"]) * mark
+                # Back-calculate effective entry so entry/uPnL are consistent
+                pos["entry_price"] = mark - (pos["unrealized_pnl"] / pos["size"])
+            else:
+                pos["entry_price"] = 0.0
+            filtered_combined[coin] = pos
+
+        return new_strategy_positions, filtered_combined
+
+    def _detect_position_changes(self, new_strategy_positions: Dict[str, Dict[str, Dict[str, Any]]]):
+        if not self._initialized:
+            self._initialized = True
+            return
+
+        if not NOTIFY_ON_POSITION_CHANGE:
+            return
+
+        for name in STRATEGIES_TO_TRACK:
+            old_coins = set(self._previous_positions.get(name, {}).keys())
+            new_coins = set(new_strategy_positions.get(name, {}).keys())
+
+            for coin in new_coins - old_coins:
+                pos = new_strategy_positions[name][coin]
+                self._notify(
+                    f"[NEW][{name}] {coin}: {pos['side']} {abs(pos['size']):.4f} @ ${pos['entry_price']:.2f}")
+
+            for coin in old_coins - new_coins:
+                old_pos = self._previous_positions[name][coin]
+                self._notify(
+                    f"[CLOSED][{name}] {coin}: was {old_pos['side']} {abs(old_pos['size']):.4f}")
+
+            for coin in old_coins & new_coins:
+                old_size = self._previous_positions[name][coin]["size"]
+                new_size = new_strategy_positions[name][coin]["size"]
+                if abs(new_size - old_size) / max(abs(old_size), 1e-10) > 0.01:
+                    direction = "INCREASED" if abs(new_size) > abs(old_size) else "DECREASED"
+                    self._notify(
+                        f"[{direction}][{name}] {coin}: {abs(old_size):.4f} -> {abs(new_size):.4f}")
+
+    async def _init_vault(self):
+        await self._discover_child_addresses()
+        await self._start_websockets()
+        await self._fetch_initial_fills()
+        await self._poll_positions()
+
+    async def _poll_positions(self):
+        new_strategy_positions, new_combined = await self._fetch_all_positions()
+        self._detect_position_changes(new_strategy_positions)
+        self._previous_positions = {name: dict(coins) for name, coins in self._strategy_positions.items()}
+        self._strategy_positions = new_strategy_positions
+        self._combined_positions = new_combined
+
+    async def _fetch_initial_fills(self):
+        start_time = int((time.time() - 3600) * 1000)  # 1 hour ago in ms
+        for name, address in self._strategy_map.items():
+            data = await self._api_request({
+                "type": "userFillsByTime",
+                "user": address,
+                "startTime": start_time,
+            })
+            if data is None:
+                continue
+            for fill in data:
+                coin = fill.get("coin", "")
+                if COINS_TO_TRACK and coin not in COINS_TO_TRACK:
+                    continue
+                trade = {
+                    "coin": coin,
+                    "side": "BUY" if fill.get("side") == "B" else "SELL",
+                    "price": float(fill.get("px", 0)),
+                    "size": float(fill.get("sz", 0)),
+                    "time": fill.get("time", 0),
+                    "fee": float(fill.get("fee", 0)),
+                    "closed_pnl": float(fill.get("closedPnl", 0)),
+                    "direction": fill.get("dir", ""),
+                    "strategy": name,
+                }
+                if coin not in self._recent_trades:
+                    self._recent_trades[coin] = []
+                self._recent_trades[coin].append(trade)
+
+        for coin in self._recent_trades:
+            self._recent_trades[coin].sort(key=lambda x: x["time"], reverse=True)
+            self._recent_trades[coin] = self._recent_trades[coin][:NUM_RECENT_TRADES]
+            if self._recent_trades[coin]:
+                self._last_seen_trade_time[coin] = self._recent_trades[coin][0]["time"]
+
+    def on_tick(self):
+        now = time.time()
+
+        if not self._strategy_map:
+            self._last_position_poll = now
+            safe_ensure_future(self._init_vault())
+            return
+
+        if now - self._last_position_poll >= POSITION_POLL_INTERVAL:
+            self._last_position_poll = now
+            safe_ensure_future(self._poll_positions())
+
+    def _format_position_table(self, positions: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Format a single strategy's position table rows."""
+        tracked = COINS_TO_TRACK if COINS_TO_TRACK else sorted(positions.keys())
+        lines = []
+        lines.append(f"  {'Coin':<10} {'Side':<6} {'Size':>12} {'Value':>13} {'Entry':>11} {'Mark':>11} {'uPnL':>12}")
+        lines.append(f"  {'─'*10} {'─'*6} {'─'*12} {'─'*13} {'─'*11} {'─'*11} {'─'*12}")
+        for coin in tracked:
+            pos = positions.get(coin)
+            if pos is None:
+                lines.append(f"  {coin:<10} {'—':<6} {'—':>12} {'—':>13} {'—':>11} {'—':>11} {'—':>12}")
+                continue
+            mark = self._current_prices.get(coin)
+            mark_str = f"${mark:,.2f}" if mark else "—"
+            entry_str = f"${pos['entry_price']:,.2f}"
+            pnl_str = f"${pos['unrealized_pnl']:+,.2f}"
+            value_str = f"${pos['position_value']:,.2f}"
+            lines.append(
+                f"  {coin:<10} {pos['side']:<6} {abs(pos['size']):>12.4f}"
+                f" {value_str:>13} {entry_str:>11} {mark_str:>11} {pnl_str:>12}"
+            )
+        return lines
+
+    def format_status(self) -> str:
+        lines = []
+        vault_name = self._vault_info.get("name", "HLP Vault")
+        apr = self._vault_info.get("apr")
+        apr_str = f" | APR: {float(apr) * 100:.2f}%" if apr else ""
+        ws_status = "LIVE" if self._ws_started else "starting..."
+
+        lines.append(f"  {vault_name}{apr_str} | WS: {ws_status}")
+        lines.append("")
+
+        if not self._strategy_positions and not self._combined_positions:
+            lines.append("  Waiting for data...")
+            return "\n".join(lines)
+
+        # Per-strategy tables
+        for name in STRATEGIES_TO_TRACK:
+            positions = self._strategy_positions.get(name, {})
+            lines.append(f"  ═══ {name} ═══")
+            lines.extend(self._format_position_table(positions))
+            lines.append("")
+
+        # Combined table
+        lines.append(f"  ═══ Combined (All Tracked) ═══")
+        lines.extend(self._format_position_table(self._combined_positions))
+
+        # Recent messages
+        lines.append(f"\n  {'─'*70}")
+        for msg in self._message_log:
+            lines.append(f"  {msg}")
+
+        return "\n".join(lines)
