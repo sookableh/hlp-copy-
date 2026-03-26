@@ -6,5 +6,7 @@ By splitting into two sub-accounts, each one can hold a clean long or short posi
 
 HLP acts as the parent vault for other strategies such as A, B, and Liquidator, with total TVL represented by HLP including its child strategies. But this parent-child structure is a protocol-level privilege — it's specific to HLP and the other protocol vaults. 
 
+Interestingly, HLP's unique position of taking over liquidated positons allows for the vault to enter at the best possible prices allows for HLP to enter at the highest highs and lowests lows. 
+
 If it were a single account, you'd have to net everything — closing a long to go short means realizing losses, paying fees, and missing the bid-ask spread in between. Two accounts let you market-make both sides of the book cleanly without those issues.
 
